@@ -88,101 +88,150 @@ protos.lm:createClones() -- reconstruct clones inside the language model
 if opt.gpuid >= 0 then for k,v in pairs(protos) do v:cuda() end end
 print("after")
 
+function mysplit(inputstr, sep)
+        if sep == nil then
+                sep = "%s"
+        end
+        local t={} ; i=1
+        for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+                t[i] = str
+                i = i + 1
+        end
+        return t
+end
+
+function sleep(n)
+    os.execute("sleep " .. tonumber(n))
+end
+
+function scandir(directory)
+    local i, t, popen = 0, {}, io.popen
+    print(directory)
+    for filename in popen('ls -a "'..directory..'"'):lines() do
+        i = i + 1
+        t[i] = filename
+    end
+    return t
+end
+function string.ends(String,End)
+   return End=='' or string.sub(String,-string.len(End))==End
+end
+
 while true do
-  -------------------------------------------------------------------------------
-  -- Create the Data Loader instance
-  -------------------------------------------------------------------------------
-  print("before")
-  local loader
-  if string.len(opt.image_folder) == 0 then
-    loader = DataLoader{h5_file = opt.input_h5, json_file = opt.input_json}
-  else
-    loader = DataLoaderRaw{folder_path = opt.image_folder, coco_json = opt.coco_json}
-  end
-  print("after")
-  
-  -------------------------------------------------------------------------------
-  -- Evaluation fun(ction)
-  -------------------------------------------------------------------------------
-  local function eval_split(split, evalopt)
-    local verbose = utils.getopt(evalopt, 'verbose', true)
-    local num_images = utils.getopt(evalopt, 'num_images', true)
-  
-    protos.cnn:evaluate()
-    protos.lm:evaluate()
-    loader:resetIterator(split) -- rewind iteator back to first datapoint in the split
-    local n = 0
-    local loss_sum = 0
-    local loss_evals = 0
-    local predictions = {}
-    while true do
-  
-      -- fetch a batch of data
-      local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
-      data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment
-      n = n + data.images:size(1)
-  
-      -- forward the model to get loss
-      local feats = protos.cnn:forward(data.images)
-  
-      -- evaluate loss if we have the labels
-      local loss = 0
-      if data.labels then
-        local expanded_feats = protos.expander:forward(feats)
-        local logprobs = protos.lm:forward{expanded_feats, data.labels}
-        loss = protos.crit:forward(logprobs, data.labels)
-        loss_sum = loss_sum + loss
-        loss_evals = loss_evals + 1
+  local image_cnt = 0
+  for k, fn in pairs(scandir(opt.image_folder)) do
+      if string.ends(fn, '.jpg') or string.ends(fn, '.jpeg') or string.ends(fn, '.JPG') or string.ends(fn, '.JPEG') then
+          image_cnt = image_cnt + 1
+          print(fn)
       end
-  
-      -- forward the model to also get generated samples for each image
-      local sample_opts = { sample_max = opt.sample_max, beam_size = opt.beam_size, temperature = opt.temperature }
-      local seq = protos.lm:sample(feats, sample_opts)
-      local sents = net_utils.decode_sequence(vocab, seq)
-      for k=1,#sents do
-        local entry = {image_id = data.infos[k].id, caption = sents[k]}
-        if opt.dump_path == 1 then
-          entry.file_name = data.infos[k].file_path
+  end
+  sleep(0.1)
+  if image_cnt ~= 0 then
+    -------------------------------------------------------------------------------
+    -- Create the Data Loader instance
+    -------------------------------------------------------------------------------
+    print("before")
+    local loader
+    if string.len(opt.image_folder) == 0 then
+      loader = DataLoader{h5_file = opt.input_h5, json_file = opt.input_json}
+    else
+      loader = DataLoaderRaw{folder_path = opt.image_folder, coco_json = opt.coco_json}
+    end
+    print("after")
+    
+    -------------------------------------------------------------------------------
+    -- Evaluation fun(ction)
+    -------------------------------------------------------------------------------
+    local function eval_split(split, evalopt)
+      local verbose = utils.getopt(evalopt, 'verbose', true)
+      local num_images = utils.getopt(evalopt, 'num_images', true)
+    
+      protos.cnn:evaluate()
+      protos.lm:evaluate()
+      loader:resetIterator(split) -- rewind iteator back to first datapoint in the split
+      local n = 0
+      local loss_sum = 0
+      local loss_evals = 0
+      local predictions = {}
+      while true do
+        -- fetch a batch of data
+        local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
+        local img_fn = data.infos[1].file_path
+        local txt_fn = mysplit(img_fn, ".")[1] .. ".txt"
+        local cmd = 'rm "' .. img_fn .. '"'
+        print(cmd)
+        os.execute(cmd)
+    
+        print(txt_fn)
+        data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment
+        n = n + data.images:size(1)
+    
+        -- forward the model to get loss
+        local feats = protos.cnn:forward(data.images)
+    
+        -- evaluate loss if we have the labels
+        local loss = 0
+        if data.labels then
+          local expanded_feats = protos.expander:forward(feats)
+          local logprobs = protos.lm:forward{expanded_feats, data.labels}
+          loss = protos.crit:forward(logprobs, data.labels)
+          loss_sum = loss_sum + loss
+          loss_evals = loss_evals + 1
         end
-        table.insert(predictions, entry)
-        if opt.dump_images == 1 then
-          -- dump the raw image to vis/ folder
-          local cmd = 'cp "' .. path.join(opt.image_root, data.infos[k].file_path) .. '" vis/imgs/img' .. #predictions .. '.jpg' -- bit gross
-          print(cmd)
-          os.execute(cmd) -- dont think there is cleaner way in Lua
+    
+        -- forward the model to also get generated samples for each image
+        local sample_opts = { sample_max = opt.sample_max, beam_size = opt.beam_size, temperature = opt.temperature }
+        local seq = protos.lm:sample(feats, sample_opts)
+        local sents = net_utils.decode_sequence(vocab, seq)
+        for k=1,#sents do
+          local entry = {image_id = data.infos[k].id, caption = sents[k]}
+          if opt.dump_path == 1 then
+            entry.file_name = data.infos[k].file_path
+          end
+          table.insert(predictions, entry)
+          if opt.dump_images == 1 then
+            -- dump the raw image to vis/ folder
+            local cmd = 'cp "' .. path.join(opt.image_root, data.infos[k].file_path) .. '" vis/imgs/img' .. #predictions .. '.jpg' -- bit gross
+            print(cmd)
+            os.execute(cmd) -- dont think there is cleaner way in Lua
+          end
+          if verbose then
+            file = io.open(txt_fn, "w")
+            file:write(entry.caption)
+            file:close(file)
+            print(string.format('image %s: %s', entry.image_id, entry.caption))
+          end
         end
+    
+        -- if we wrapped around the split or used up val imgs budget then bail
+        local ix0 = data.bounds.it_pos_now
+        local ix1 = math.min(data.bounds.it_max, num_images)
         if verbose then
-          print(string.format('image %s: %s', entry.image_id, entry.caption))
+          print(string.format('evaluating performance... %d/%d (%f)', ix0-1, ix1, loss))
         end
+    
+        if data.bounds.wrapped then break end -- the split ran out of data, lets break out
+        if num_images >= 0 and n >= num_images then break end -- we've used enough images
+
       end
-  
-      -- if we wrapped around the split or used up val imgs budget then bail
-      local ix0 = data.bounds.it_pos_now
-      local ix1 = math.min(data.bounds.it_max, num_images)
-      if verbose then
-        print(string.format('evaluating performance... %d/%d (%f)', ix0-1, ix1, loss))
+    
+      local lang_stats
+      if opt.language_eval == 1 then
+        lang_stats = net_utils.language_eval(predictions, opt.id)
       end
-  
-      if data.bounds.wrapped then break end -- the split ran out of data, lets break out
-      if num_images >= 0 and n >= num_images then break end -- we've used enough images
+
+      return loss_sum/loss_evals, predictions, lang_stats
     end
-  
-    local lang_stats
-    if opt.language_eval == 1 then
-      lang_stats = net_utils.language_eval(predictions, opt.id)
+    
+    local loss, split_predictions, lang_stats = eval_split(opt.split, {num_images = opt.num_images})
+    print('loss: ', loss)
+    if lang_stats then
+      print(lang_stats)
     end
-  
-    return loss_sum/loss_evals, predictions, lang_stats
-  end
-  
-  local loss, split_predictions, lang_stats = eval_split(opt.split, {num_images = opt.num_images})
-  print('loss: ', loss)
-  if lang_stats then
-    print(lang_stats)
-  end
-  
-  if opt.dump_json == 1 then
-    -- dump the json
-    utils.write_json('vis/vis.json', split_predictions)
+    
+    if opt.dump_json == 1 then
+      -- dump the json
+      utils.write_json('vis/vis.json', split_predictions)
+    end
   end
 end
